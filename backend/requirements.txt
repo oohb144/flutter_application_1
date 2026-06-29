@@ -1,0 +1,12 @@
+# K230 联机电脑端 Python 后端依赖
+# 安装：pip install -r requirements.txt
+# 注意：onnxruntime 与 onnxruntime-gpu 二选一，不要同时装。
+#       有 NVIDIA GPU 装上面的 insightface + onnxruntime-gpu，否则用 onnxruntime（CPU）。
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+insightface>=0.7.3
+onnxruntime>=1.16             # CPU；GPU 改用 onnxruntime-gpu
+opencv-python>=4.8
+numpy>=1.24
+python-multipart>=0.0.6       # FastAPI 文件上传
