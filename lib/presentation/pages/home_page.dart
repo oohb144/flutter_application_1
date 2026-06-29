@@ -65,20 +65,21 @@ class _HomePageState extends State<HomePage> {
             const BackendControl(),
             const SizedBox(height: 12),
             // RTSP 拉流显示 + 人脸框叠加
-            AspectRatio(
-              aspectRatio: 640 / 480,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  RtspPlayer(rtspUrl: s.rtspUrl),
-                  FaceOverlay(
-                      boxes: context.watch<DetectionProvider>().boxes),
-                ],
+            Expanded(
+              child: AspectRatio(
+                aspectRatio: 640 / 480,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    RtspPlayer(rtspUrl: s.rtspUrl),
+                    FaceOverlay(
+                        boxes: context.watch<DetectionProvider>().boxes),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 12),
             const CommandButtons(),
-            const Spacer(),
           ],
         ),
       ),
