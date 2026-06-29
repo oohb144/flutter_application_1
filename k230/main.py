@@ -69,6 +69,10 @@ class FaceRecognitionApp:
         self._toast_time = 0
         self._frame_count = 0
 
+        # WiFi 设置界面状态
+        self._wifi_mode = False        # True: 在 WiFi 设置全屏界面
+        self._wifi_ui = None           # WiFiUI 实例（_init_modules 中创建）
+
     # ---------- 初始化 ----------
     def _init_pipeline(self):
         from media.sensor import Sensor
@@ -90,13 +94,35 @@ class FaceRecognitionApp:
 
     def _connect_wifi(self):
         print("[主] 连接 WiFi...")
-        ip, wlan = connect_wifi()
+        # 优先用保存的 WiFi 配置（最近一次成功连接的）
+        ssid = config.WIFI_SSID
+        pwd = config.WIFI_PASSWORD
+        try:
+            from wifi_ui import load_saved_wifi
+            saved = load_saved_wifi()
+            if saved:
+                ssid, pwd = saved
+                print("[主] 用保存的配置: " + ssid)
+            else:
+                print("[主] 用默认配置: " + ssid)
+        except Exception as e:
+            print("[主] 读保存配置异常，用默认: " + str(e))
+        # 离线开机时 WiFi 驱动可能未就绪，重试 3 次
+        ip = None
+        wlan = None
+        for attempt in range(3):
+            ip, wlan = connect_wifi(ssid, pwd)
+            if ip:
+                break
+            print("[主] WiFi 第 " + str(attempt + 1) + " 次连接失败，3秒后重试...")
+            if attempt < 2:
+                time.sleep(3)
         self._ip = ip
         self._wlan = wlan
         if ip:
             self._set_toast(f"WiFi已连 IP:{ip}")
         else:
-            self._set_toast("WiFi连接失败")
+            self._set_toast("WiFi连接失败，可在WiFi界面手动设置")
 
     def _init_modules(self):
         print("[主] 初始化 FaceDetector...")
@@ -143,6 +169,10 @@ class FaceRecognitionApp:
         else:
             print("[主] 触摸UI未启用 (TOUCH_ENABLE=False)")
         print("[主] TouchUI 完成")
+        print("[主] 初始化 WiFiUI...")
+        from wifi_ui import WiFiUI
+        self._wifi_ui = WiFiUI(self)
+        print("[主] WiFiUI 完成")
 
     def _register_states(self):
         """注册状态机 handler 与进/出回调"""
@@ -357,6 +387,17 @@ class FaceRecognitionApp:
             if not self._sm.is_state(int(config.State.ENROLLING)):
                 self._sm.transition(int(config.State.ENROLLING))
             self._do_enroll()
+        elif cmd_id == RecvCmd.WIFI_SETTINGS:
+            # 切换 WiFi 设置界面（toggle）
+            self._wifi_mode = not self._wifi_mode
+            if self._wifi_mode:
+                self._set_toast("进入 WiFi 设置")
+                if self._wifi_ui:
+                    self._wifi_ui.enter()
+            else:
+                self._set_toast("退出 WiFi 设置")
+                if self._wifi_ui:
+                    self._wifi_ui.exit()
 
     def _send_state(self, state_cmd):
         """发状态播报给语音模块"""
@@ -426,6 +467,41 @@ class FaceRecognitionApp:
         """设置浮层提示信息（显示一段时间后消失）"""
         self._toast_msg = msg
         self._toast_time = time.ticks_ms()
+
+    # ---------- WiFi 设置界面（委托给 WiFiUI） ----------
+    def _handle_wifi_settings(self):
+        """全屏 OSD 绘制 + 触摸处理，全部委托给 WiFiUI 实例"""
+        if self._wifi_ui is None:
+            self._wifi_mode = False
+            return
+        # 绘制全屏 OSD
+        self._wifi_ui.draw(self._pl.osd_img)
+        # 触摸处理：复用 TouchUI 的去抖状态（DOWN 上升沿 + 300ms 去抖）
+        if self._touch is None:
+            return
+        try:
+            pts = self._touch._tp.read(1)
+            if not pts:
+                self._touch._last_evt = None
+                return
+            pt = pts[0]
+            down_evt = self._touch._down_evt
+            is_down = (pt.event == down_evt)
+            last_evt = self._touch._last_evt
+            is_down_edge = (is_down and last_evt != down_evt)
+            if is_down_edge:
+                now = time.ticks_ms()
+                if time.ticks_diff(now, self._touch._last_trigger) >= 300:
+                    self._touch._last_trigger = now
+                    result = self._wifi_ui.handle_touch(pt, is_down_edge=True)
+                    if result == "exit":
+                        # WiFiUI 通知退出
+                        self._wifi_mode = False
+                        self._wifi_ui.exit()
+                        self._set_toast("退出 WiFi 设置")
+            self._touch._last_evt = pt.event
+        except Exception as e:
+            print("[主] WiFi 触摸处理异常: " + str(e))
 
     # ---------- 状态 handler ----------
     def _handle_idle(self):
@@ -615,17 +691,21 @@ class FaceRecognitionApp:
                 # HTTP 命令 + face_result（主线程消费队列，电脑端联机）
                 self._process_http_commands()
                 self._process_face_results()
-                # 触摸屏（读触点，命中入队）
-                if self._touch:
-                    self._touch.update()
-                # 状态机业务（绘制到 osd_img）
-                self._sm.update()
-                # 状态上报给 HTTP 服务（跳帧降开销，指纹变化才重建 JSON）
-                if self._frame_count % config.STATUS_SKIP_FRAMES == 0:
-                    self._update_http_status()
-                # 触摸侧边栏画在最上层
-                if self._touch:
-                    self._touch.draw(self._pl.osd_img)
+                # 触摸屏（读触点，命中入队）/ 状态机业务 / 侧边栏
+                if self._wifi_mode:
+                    # WiFi 设置全屏界面：自己处理触摸和绘制，不画状态机和侧边栏
+                    self._handle_wifi_settings()
+                else:
+                    if self._touch:
+                        self._touch.update()
+                    # 状态机业务（绘制到 osd_img）
+                    self._sm.update()
+                    # 状态上报给 HTTP 服务（跳帧降开销，指纹变化才重建 JSON）
+                    if self._frame_count % config.STATUS_SKIP_FRAMES == 0:
+                        self._update_http_status()
+                    # 触摸侧边栏画在最上层
+                    if self._touch:
+                        self._touch.draw(self._pl.osd_img)
 
                 # 显示
                 self._pl.show_image()

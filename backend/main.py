@@ -39,15 +39,19 @@ async def lifespan(app: FastAPI):
     global face_app, face_db, capture
     args = app.state.args
     face_db = FaceDB()
-    face_app = FaceAnalysis(
-        name=args.model,
-        allowed_modules=["detection", "recognition"],
-        providers=[args.providers],
-    )
-    face_app.prepare(ctx_id=args.ctx, det_size=tuple(args.det_size))
-    print(f"[main] FaceAnalysis ready: {args.model} providers={args.providers}")
 
-    if args.rtsp:
+    if args.no_model:
+        print("[main] --no-model: skipping FaceAnalysis init, face-db endpoints will fail")
+    else:
+        face_app = FaceAnalysis(
+            name=args.model,
+            allowed_modules=["detection", "recognition"],
+            providers=[args.providers],
+        )
+        face_app.prepare(ctx_id=args.ctx, det_size=tuple(args.det_size))
+        print(f"[main] FaceAnalysis ready: {args.model} providers={args.providers}")
+
+    if args.rtsp and face_app is not None:
         loop = asyncio.get_running_loop()
         capture = RtspCapture(
             rtsp_url=args.rtsp,
@@ -61,7 +65,7 @@ async def lifespan(app: FastAPI):
         capture.start()
         print(f"[main] RtspCapture started: {args.rtsp}")
     else:
-        print("[main] no --rtsp, running in face-db-only mode")
+        print("[main] no face detection running")
 
     yield
 
@@ -117,6 +121,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.post("/face/register_from_rtsp")
     async def register_from_rtsp(name: str = Form(...)) -> dict:
+        if face_app is None:
+            return {"ok": False, "msg": "FaceAnalysis not loaded (--no-model)"}
         if capture is None:
             return {"ok": False, "msg": "capture not running (no --rtsp)"}
         frame = capture.get_last_frame()
@@ -130,6 +136,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.post("/face/register")
     async def register_upload(name: str = Form(...), file: UploadFile = File(...)) -> dict:
+        if face_app is None:
+            return {"ok": False, "msg": "FaceAnalysis not loaded (--no-model)"}
         data = await file.read()
         img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
@@ -170,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ctx", type=int, default=-1, help="insightface ctx_id，-1=CPU，0=GPU0")
     p.add_argument("--det-size", type=int, nargs=2, default=[640, 640])
     p.add_argument("--interval", type=float, default=0.3, help="检测间隔秒数")
+    p.add_argument("--no-model", action="store_true", help="跳过 InsightFace 模型加载（轻量启动，仅 WS/健康检查）")
     return p.parse_args()
 
 

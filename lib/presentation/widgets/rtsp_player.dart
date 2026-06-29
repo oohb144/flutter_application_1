@@ -6,6 +6,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 ///
 /// 低延迟配置：profile=low-latency、rtsp-transport=tcp、清缓存。
 /// [rtspUrl] 变化（K230 IP 改动）时自动重新 open。
+/// 连接失败后自动重试（最多 5 次，间隔递增）。
 class RtspPlayer extends StatefulWidget {
   final String rtspUrl;
 
@@ -22,6 +23,8 @@ class _RtspPlayerState extends State<RtspPlayer> {
   String? _lastUrl;
   String? _error;
   bool _loading = true;
+  int _retryCount = 0;
+  static const int _maxRetries = 5;
 
   @override
   void initState() {
@@ -35,19 +38,12 @@ class _RtspPlayerState extends State<RtspPlayer> {
   }
 
   Future<void> _applyLowLatency() async {
-    // mpv 低延迟参数，适用于 IP 摄像头 RTSP。
-    // setProperty 由 NativePlayer（player.platform）提供，桌面端可用。
     final plat = _player.platform as dynamic;
     if (plat == null) return;
     try {
-      await plat.setProperty('profile', 'low-latency');
       await plat.setProperty('rtsp-transport', 'tcp');
-      await plat.setProperty('demuxer-max-backward', '0');
-      await plat.setProperty('demuxer-max-forward', '0');
-      await plat.setProperty('cache', 'no');
-    } catch (_) {
-      // 部分 mpv 属性在某些平台可能不可用，忽略
-    }
+      await plat.setProperty('rtsp-timeout', '15');
+    } catch (_) {}
   }
 
   Future<void> _open(String url) async {
@@ -62,16 +58,29 @@ class _RtspPlayerState extends State<RtspPlayer> {
     try {
       await _player.open(Media(url));
       _lastUrl = url;
+      _retryCount = 0;
     } catch (e) {
       _error = e.toString();
+      _retryWithDelay();
     }
     if (mounted) setState(() => _loading = false);
+  }
+
+  void _retryWithDelay() {
+    if (_retryCount >= _maxRetries || !mounted) return;
+    _retryCount++;
+    final delay = Duration(seconds: 2 * _retryCount);
+    Future.delayed(delay, () {
+      if (!mounted || _lastUrl == widget.rtspUrl) return;
+      _open(widget.rtspUrl);
+    });
   }
 
   @override
   void didUpdateWidget(covariant RtspPlayer old) {
     super.didUpdateWidget(old);
     if (old.rtspUrl != widget.rtspUrl) {
+      _retryCount = 0;
       _open(widget.rtspUrl);
     }
   }
@@ -99,7 +108,7 @@ class _RtspPlayerState extends State<RtspPlayer> {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 color: Colors.black54,
-                child: Text('拉流错误：$_error',
+                child: Text('拉流错误：$_error（重试 $_retryCount/${_maxRetries}）',
                     style: const TextStyle(color: Colors.red, fontSize: 12)),
               ),
             ),

@@ -26,10 +26,13 @@ def connect_wifi(ssid=None, password=None, timeout_sec=None):
     try:
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
+        # 离线开机时 WiFi 驱动需时间就绪，active 后等待生效
+        time.sleep_ms(800)
         # 已连接则先断开，避免重复连接卡住
         try:
             if wlan.isconnected():
                 wlan.disconnect()
+                time.sleep_ms(300)
         except Exception:
             pass
         wlan.connect(ssid, password)
@@ -37,10 +40,13 @@ def connect_wifi(ssid=None, password=None, timeout_sec=None):
         start = time.ticks_ms()
         while True:
             try:
+                # isconnected=True 不代表 IP 已拿到（DHCP 可能未完成），
+                # 必须 ifconfig 非 0.0.0.0 才算真正连上
                 if wlan.isconnected():
                     ip = wlan.ifconfig()[0]
-                    print(f"[WiFi] 已连接, IP={ip}")
-                    return (ip, wlan)
+                    if ip != "0.0.0.0" and ip != "":
+                        print(f"[WiFi] 已连接, IP={ip}")
+                        return (ip, wlan)
             except Exception:
                 pass
             if time.ticks_diff(time.ticks_ms(), start) >= timeout_sec * 1000:

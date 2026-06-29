@@ -24,16 +24,16 @@ class AppConfig {
   // K230 默认 IP（占位，首次启动需在设置页填入真实 IP）
   static const String defaultK230Ip = '192.168.123.183';
 
-  // 状态轮询间隔
-  static const Duration statusPollInterval = Duration(seconds: 2);
+  // 状态轮询间隔（K230 嵌入式设备不宜频繁请求）
+  static const Duration statusPollInterval = Duration(seconds: 10);
 
   // 人脸识别余弦相似度阈值（ArcFace 已 L2 归一化，点积即余弦）
   static const double defaultThreshold = 0.35;
   static const double minThreshold = 0.30;
   static const double maxThreshold = 0.50;
 
-  // HTTP 超时
-  static const Duration httpTimeout = Duration(seconds: 3);
+  // HTTP 超时（K230 嵌入式设备响应较慢，适当放宽）
+  static const Duration httpTimeout = Duration(seconds: 10);
 
   /// 构造 K230 base URL，如 http://192.168.123.183:8001
   static String k230BaseUrl(String ip) => 'http://$ip:$k230HttpPort';

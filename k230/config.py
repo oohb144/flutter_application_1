@@ -141,6 +141,13 @@ WIFI_PASSWORD = "mstxdict"
 # WiFi 连接超时（秒）
 WIFI_TIMEOUT_SEC = 20
 
+# WiFi 设置界面预设列表（触摸选中直接连；用户按需增删条目）
+WIFI_PRESETS = [
+    ("码上同行的ICT", "mstxdict"),
+    ("MyHome",        "password123"),
+    ("Office",        "office_wifi_pwd"),
+]
+
 # ==================== 语音识别配置（阶段4） ====================
 # 单唤醒词（kws.kmodel，固化"小南小南"，占KPU需时分复用）
 # 注：当前固件(CanMV v1.4.3 yahboom)无 speech_recognizer/media.audio，

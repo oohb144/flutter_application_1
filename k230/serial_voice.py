@@ -56,6 +56,7 @@ class RecvCmd:
     RTSP_OFF       = 0x06   # 关 RTSP
     ENROLL_CAPTURE = 0x07   # 录入当前帧
     RTSP_TOGGLE    = 0x08   # 触摸推流按钮专用（toggle）；串口用 RTSP_ON/OFF
+    WIFI_SETTINGS  = 0x09   # 进入/退出 WiFi 设置界面（触摸 WiFi 按钮）
 
 
 class SendCmd:
@@ -75,6 +76,7 @@ RECV_CMD_NAMES = {
     RecvCmd.RTSP_ON: "RTSP_ON", RecvCmd.RTSP_OFF: "RTSP_OFF",
     RecvCmd.ENROLL_CAPTURE: "ENROLL_CAPTURE",
     RecvCmd.RTSP_TOGGLE: "RTSP_TOGGLE",
+    RecvCmd.WIFI_SETTINGS: "WIFI_SETTINGS",
 }
 
 

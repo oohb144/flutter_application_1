@@ -31,7 +31,7 @@ class StatusBar extends StatelessWidget {
             Expanded(
               child: Text(
                 s == null
-                    ? (p.lastError ?? '未查询')
+                    ? (online ? '查询中' : 'K230 HTTP 服务未响应')
                     : 'IP ${s.ip.isEmpty ? "(空)" : s.ip} · ${s.state} · 推流 ${s.rtspRunning ? "开" : "关"} · 音频 ${s.audioBusy ? "忙" : "闲"}',
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.bodySmall,
