@@ -100,7 +100,7 @@ AUDIO_ENABLE = True
 BUZZER_ENABLE = True  # 蜂鸣器提示（切换界面/连WiFi/识别到人脸等；False 全静音）
 LED_ENABLE = True
 VOICE_ENABLE = False  # 本机KWS（麦克风采集疑似有问题，跳过；voice_recognition.py 备用）
-ONLINE_VOICE_ENABLE = False  # 在线语音（DashScope 流式识别，连接不稳定暂关）
+ONLINE_VOICE_ENABLE = True  # 在线语音（DashScope 一次性录音识别，按钮触发录 4s）
 # 哪些状态自动暂停语音识别（让出麦克风/网络/避免 GIL 抢占）
 # 用整数：RECOGNIZING=1 / ENROLLING=2 / RECORDING=3 / MANUAL_RECORDING=4
 # 默认 set() = 始终听（用户选择，可能影响识别帧率；卡得受不了改成 {1} 暂停识别态）
@@ -156,7 +156,7 @@ WIFI_PRESETS = [
 # ==================== 语音管理器配置（离线关键词，方案二） ====================
 # 触摸"语音"按钮 → 开始监听 → 识别到关键词 → 切换界面
 # 优先 speech_recognizer（离线多词），不可用时回退 kws.kmodel（唤醒词"小南小南"循环切态）
-VOICE_MGR_ENABLE = True   # 语音管理器总开关
+VOICE_MGR_ENABLE = False   # 离线语音管理器（已改用在线语音，关闭离线；备份已存）
 VOICE_LISTEN_TIMEOUT_MS = 8000   # 按键触发后监听超时（毫秒），WS 就绪后才开始计时
 VOICE_WAKE_WORD = "小南小南"     # kws.kmodel 回退方案唤醒词（固化在模型里，仅显示用）
 VOICE_WAKE_THRESHOLD = 0.5       # kws.kmodel 唤醒阈值
@@ -207,6 +207,8 @@ ONLINE_VOICE_KEYWORDS = {
 # DashScope 在线识别（阶段4思路文档用）
 DASHSCOPE_API_KEY = "sk-dc4553ef7fe74c5283f05e4dc7d60adb"
 ONLINE_VOICE_SAMPLE_RATE = 16000
+# 一次性录音模式：按「语音」按钮后录这么久（毫秒），录完上传识别
+ONLINE_VOICE_RECORD_MS = 4000
 # 每次采集/上传的音频块时长（毫秒），越小延迟越低但网络开销越大
 ONLINE_VOICE_CHUNK_MS = 100
 # 会话断开后的重连等待时长（毫秒），避免快速重试刷屏/打服务端

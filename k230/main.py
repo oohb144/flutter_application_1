@@ -60,10 +60,11 @@ class FaceRecognitionApp:
         self._cmd_queue = []
         self._cmd_lock = _thread.allocate_lock()
 
-        # 在线语音识别（DashScope 流式，按钮触发）
+        # 在线语音识别（DashScope 一次性录音，按钮触发）
         self._ovr = None
         self._voice_cmd_queue = []
         self._voice_cmd_lock = _thread.allocate_lock()
+        self._rtsp_resume_after_voice = False  # 录音前暂停了 RTSP，录完需恢复
 
         # 触摸屏 UI
         self._touch = None
@@ -232,14 +233,14 @@ class FaceRecognitionApp:
                 api_key=config.DASHSCOPE_API_KEY,
                 sample_rate=config.ONLINE_VOICE_SAMPLE_RATE,
                 chunk_ms=getattr(config, "ONLINE_VOICE_CHUNK_MS", 100),
-                reconnect_delay_ms=getattr(config, "ONLINE_VOICE_RECONNECT_DELAY_MS", 800),
+                record_ms=getattr(config, "ONLINE_VOICE_RECORD_MS", 4000),
             )
             self._ovr.start(
                 keywords=config.ONLINE_VOICE_KEYWORDS,
                 callback=self._on_voice_command,
             )
             # 默认不监听，等按钮触发
-            print("[主] 在线语音已启动（默认暂停，按语音按钮开始监听）")
+            print("[主] 在线语音已就绪（按语音按钮录 4s 识别）")
         except Exception as e:
             print(f"[主] 在线语音初始化失败（不影响按键/识别）: {e}")
             self._ovr = None
@@ -262,6 +263,32 @@ class FaceRecognitionApp:
                 self._dispatch_http_command({"cmd": command, "source": "voice"})
             except Exception as e:
                 print(f"[主] 在线语音命令执行异常: {e}")
+
+    def _process_voice_finish(self):
+        """主循环调用：一次录音会话结束后处理（恢复推流/提示未命中）。
+        若命中了关键词（已切界面），不强行恢复 RTSP，尊重用户语音意图。"""
+        if self._ovr is None:
+            return
+        if not self._ovr.poll_finished():
+            return
+        matched = self._ovr.last_matched()
+        if matched:
+            # 命中关键词：命令已由 _process_voice_commands 执行，提示即可
+            self._buzz("beep_success")
+        else:
+            self._set_toast("语音: 未识别到关键词")
+        # 录音前若暂停过推流，且本次未切界面，则恢复推流
+        if self._rtsp_resume_after_voice:
+            self._rtsp_resume_after_voice = False
+            if not matched:
+                try:
+                    if not self._sm.is_state(int(config.State.RECOGNIZING)):
+                        self._sm.transition(int(config.State.RECOGNIZING))
+                    if self._rtsp and not self._rtsp.is_running():
+                        self._rtsp.start()
+                        self._set_toast("语音结束，已恢复推流")
+                except Exception as e:
+                    print(f"[主] 恢复推流失败: {e}")
 
     def _init_voice(self):
         """初始化离线语音管理器（懒加载：开机不加载 kws.kmodel 占 KPU，按语音按钮时才加载）"""
@@ -571,36 +598,25 @@ class FaceRecognitionApp:
                     self._wifi_ui.exit()
             self._buzz_transition()  # 切界面提示音
         elif cmd_id == RecvCmd.VOICE_START:
-            # 触摸"语音"按钮：启动/停止语音监听（优先在线，备选离线）
-            if self._ovr is not None and hasattr(self._ovr, 'start_listening'):
-                # 在线语音（DashScope）
-                if self._ovr.is_listening():
-                    self._ovr.stop_listening()
-                    self._set_toast("语音: 已停止")
-                else:
-                    timeout = getattr(config, "VOICE_LISTEN_TIMEOUT_MS", 8000)
-                    self._ovr.start_listening(timeout_ms=timeout)
-                    self._set_toast("语音监听中...说关键词")
-                    self._buzz_transition()
+            # 触摸"语音"按钮：一次性录音识别（录 4s → 上传 → 回发切界面）
+            if self._ovr is None:
+                self._set_toast("在线语音未就绪（检查 WiFi）")
+            elif self._ovr.is_listening():
+                # 会话进行中再按一次 = 取消
+                self._ovr.stop_listening()
+                self._set_toast("语音: 已取消")
             else:
-                # 离线语音：懒加载，第一次按按钮时才初始化（避免开机占 KPU）
-                if self._voice is None:
-                    self._init_voice()
-                if self._voice is not None:
-                    if self._voice.is_listening():
-                        self._voice.stop_listening()
-                        self._set_toast("语音: 已停止")
-                    else:
-                        self._voice.start_listening()
-                        mode = self._voice.get_mode()
-                        if mode == "kws":
-                            wake = getattr(config, "VOICE_WAKE_WORD", "小南小南")
-                            self._set_toast(f"语音监听中...说'{wake}'")
-                        else:
-                            self._set_toast("语音监听中...说关键词")
-                        self._buzz_transition()
+                # 录音(麦克风)与 RTSP(VENC) 互斥：录音前先暂停推流，录完自动恢复
+                if self._rtsp and self._rtsp.is_running():
+                    self._rtsp.stop()
+                    self._rtsp_resume_after_voice = True
+                    self._set_toast("暂停推流，请说话 4s...")
                 else:
-                    self._set_toast("语音未就绪")
+                    self._rtsp_resume_after_voice = False
+                    self._set_toast("请说话 4s...")
+                rec_ms = getattr(config, "ONLINE_VOICE_RECORD_MS", 4000)
+                self._ovr.start_listening(timeout_ms=rec_ms)
+                self._buzz_transition()
 
     def _send_state(self, state_cmd):
         """发状态播报给语音模块"""
@@ -770,7 +786,7 @@ class FaceRecognitionApp:
         if self._toast_msg and time.ticks_diff(time.ticks_ms(), self._toast_time) < config.ENROLL_SHOW_TIME:
             osd_img.draw_string_advanced(10, 200, 26, self._toast_msg,
                                          color=config.TEXT_COLOR_YELLOW)
-        # 语音监听倒计时（在线/离线）
+        # 语音监听倒计时（在线一次性录音）
         _ovr_active = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
         _voice_active = self._voice and self._voice.is_listening()
         if _ovr_active:
@@ -779,12 +795,9 @@ class FaceRecognitionApp:
                 sec = (remaining + 999) // 1000
                 osd_img.draw_string_advanced(10, 230, 30,
                     f"请说话... {sec}s", color=(0, 255, 200))
-            elif remaining == 0:
-                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 连接中...",
-                    color=(255, 200, 0))
             else:
-                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 监听中...",
-                    color=(0, 255, 200))
+                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 识别中...",
+                    color=(255, 200, 0))
         elif _voice_active:
             osd_img.draw_string_advanced(10, 230, 26, "[MIC] 监听中...",
                 color=(0, 255, 200))
@@ -907,7 +920,7 @@ class FaceRecognitionApp:
             if self._rtsp is not None and self._rtsp.is_running():
                 osd_img.draw_string_advanced(10, 64, 20, self._rtsp.get_url(),
                                              color=config.TEXT_COLOR_GREEN)
-            # 语音监听状态（在线/离线）+ 倒计时
+            # 语音监听状态（在线一次性录音）+ 倒计时
             _ovr_listening = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
             _voice_listening = self._voice and self._voice.is_listening()
             if _ovr_listening:
@@ -916,12 +929,9 @@ class FaceRecognitionApp:
                     sec = (remaining + 999) // 1000   # 向上取整
                     osd_img.draw_string_advanced(10, 86, 26,
                         f"请说话... {sec}s", color=(0, 255, 200))
-                elif remaining == 0:
-                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 连接中...",
-                        color=(255, 200, 0))
                 else:
-                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 语音监听中...",
-                        color=(0, 255, 200))
+                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 识别中...",
+                        color=(255, 200, 0))
             elif _voice_listening:
                 osd_img.draw_string_advanced(10, 86, 22, "[MIC] 语音监听中...",
                                              color=(0, 255, 200))
@@ -976,10 +986,9 @@ class FaceRecognitionApp:
                 self._process_voice_wake()
                 if self._voice:
                     self._voice.check_timeout()
-                # 在线语音：命令队列消费 + 监听超时检查
+                # 在线语音：命令队列消费 + 录音结束检查（恢复 RTSP）
                 self._process_voice_commands()
-                if self._ovr and hasattr(self._ovr, 'check_timeout'):
-                    self._ovr.check_timeout()
+                self._process_voice_finish()
                 # HTTP 命令 + face_result（主线程消费队列，电脑端联机）
                 self._process_http_commands()
                 self._process_face_results()

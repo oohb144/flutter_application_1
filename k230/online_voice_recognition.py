@@ -239,61 +239,72 @@ class _WSClient:
             pass
 
 
-# ==================== 在线语音识别器 ====================
+# ==================== 在线语音识别器（一次性录音模式） ====================
+
+# 监听阶段
+PHASE_IDLE = 0        # 空闲
+PHASE_RECORDING = 1   # 录音中（麦克风打开，倒计时）
+PHASE_UPLOADING = 2   # 上传识别中（麦克风已释放，等服务端回发）
+
 
 class OnlineVoiceRecognition:
     """
-    在线语音识别器（DashScope 实时流式）
+    在线语音识别器（DashScope 一次性录音模式 one-shot）
+
+    交互：按一下「语音」按钮 → 录固定时长（默认 4s）→ 释放麦克风
+          → 连 WS 把整段音频快速发上去 → 收整句结果 → 关键词子串匹配 → 回调。
+
+    与旧版流式的关键差异（也是修复 RTSP 冲突的核心）：
+      - 旧版常驻会话线程长期占麦克风（PyAudio），与 VENC 硬编码互斥 → RTSP 起不来。
+      - 新版麦克风只在那几秒短暂打开，录完立刻释放；网络阶段完全不碰音频。
+      - 配合主程序「录音前暂停 RTSP、录完恢复」，两者彻底不冲突。
 
     用法：
         ovr = OnlineVoiceRecognition(api_key="sk-xxx")
-        ovr.set_pause_callback(should_pause)
         ovr.start(keywords={'主界面': 'home'}, callback=on_command)
+        ovr.start_listening(timeout_ms=4000)   # 按钮触发，录 4 秒
         ...
         ovr.destroy()
     """
 
     def __init__(self, api_key, sample_rate=SAMPLE_RATE,
-                 chunk_ms=AUDIO_CHUNK_MS,
-                 pause_sleep_ms=200, reconnect_delay_ms=800):
+                 chunk_ms=AUDIO_CHUNK_MS, record_ms=4000,
+                 reconnect_delay_ms=800):
         """
         参数:
             api_key: DashScope API Key
             sample_rate: 采样率（需与模型参数一致）
-            chunk_ms: 每次采集/上传的音频块时长（毫秒）
-            pause_sleep_ms: 暂停状态下的轮询睡眠时长
-            reconnect_delay_ms: 会话断开后的重连等待时长
+            chunk_ms: 每次采集的音频块时长（毫秒）
+            record_ms: 单次录音时长（毫秒），按按钮后录这么久
+            reconnect_delay_ms: 兼容旧签名，本模式未使用
         """
         self._api_key = api_key
         self._sample_rate = sample_rate
-        self._pause_sleep_ms = pause_sleep_ms
-        self._reconnect_delay_ms = reconnect_delay_ms
+        self._record_ms = record_ms
 
         self._keywords = {}          # {中文文本: 命令名}
         self._callback = None        # 识别命中回调
-        self._pause_callback = None  # 暂停判断回调（外部状态暂停，如识别态让出麦克风）
 
-        self._is_running = False
-        self._is_listening = False   # 按钮触发监听状态（False=暂停，True=监听中）
-        self._listen_start_time = 0
-        self._listen_timeout_ms = 8000  # 默认 8 秒超时（从 WS 就绪后开始计时）
-        self._ws_ready = False          # WS 连接 + task-started 后才为 True
+        self._is_running = False     # 已 start（就绪可接受按钮触发）
+        self._is_listening = False   # 一次会话进行中（录音或上传）
+        self._phase = PHASE_IDLE
+        self._record_start = 0       # 录音开始时刻（倒计时用）
 
-        # 当前会话对象（每次重连重建）
-        self._ws = None
-        self._task_id = None
-        self._task_started = False
-        self._session_active = False
+        self._lock = _thread.allocate_lock()
+        self._just_finished = False  # 本次会话刚结束（主循环消费一次）
+        self._last_matched = None    # 本次会话命中的命令（None=未命中）
+        self._last_text = ""         # 最近识别文本（调试/显示用）
 
         # PyAudio 录音对象
         self._pyaudio = None
         self._stream = None
         self._chunk_frames = int(self._sample_rate * chunk_ms / 1000)
 
-        # 命令去抖 {命令名: 上次触发时间ms}
-        self._last_trigger = {}
+        # 单次会话内的临时事件状态
+        self._task_started = False
+        self._session_active = False
 
-        print("[在线语音] 模块初始化完成")
+        print("[在线语音] 模块初始化完成（一次性录音模式）")
 
     # ---------- 配置接口 ----------
 
@@ -306,19 +317,13 @@ class OnlineVoiceRecognition:
         """设置识别命中回调，回调接收命令名字符串"""
         self._callback = callback
 
-    def set_pause_callback(self, callback):
-        """设置暂停判断回调，返回 True 时暂停采集上传"""
-        self._pause_callback = callback
-
     def is_running(self):
         return self._is_running
 
     # ---------- 启停控制 ----------
 
     def start(self, keywords=None, callback=None):
-        """启动在线语音识别"""
-        if self._is_running:
-            return True
+        """登记关键词/回调，置为就绪态（不启动任何线程，等按钮触发）"""
         if keywords:
             self.set_keywords(keywords)
         if callback:
@@ -326,156 +331,171 @@ class OnlineVoiceRecognition:
         if not self._keywords:
             print("[在线语音] 未设置关键词，启动失败")
             return False
-        try:
-            self._is_running = True
-            _thread.start_new_thread(self._session_loop, ())
-            print("[在线语音] 已启动，关键词:")
-            for text, cmd in self._keywords.items():
-                print(f"  - {text} -> {cmd}")
-            return True
-        except Exception as e:
-            print(f"[在线语音] 启动失败: {e}")
-            self._is_running = False
-            return False
+        self._is_running = True
+        print("[在线语音] 已就绪，关键词:")
+        for text, cmd in self._keywords.items():
+            print(f"  - {text} -> {cmd}")
+        return True
 
     def stop(self):
-        """停止在线语音识别"""
-        if not self._is_running:
-            return
+        """停止：取消当前会话"""
         self._is_running = False
         self._is_listening = False
-        self._close_session()
-        time.sleep_ms(200)
-        print("[在线语音] 已停止")
+        self._session_active = False
 
     # ---------- 按钮触发监听控制 ----------
 
     def start_listening(self, timeout_ms=None):
-        """按钮触发：开始监听（默认暂停，按需启动）"""
+        """按钮触发：开始一次录音+识别会话（录 record_ms 毫秒）"""
         if not self._is_running:
-            print("[在线语音] 未运行，无法开始监听")
+            print("[在线语音] 未就绪，无法开始")
             return False
         if self._is_listening:
             return True
-        self._is_listening = True
-        self._ws_ready = False          # 等 WS 连接成功后才计时
-        self._listen_start_time = 0     # task-started 时才设值
         if timeout_ms is not None:
-            self._listen_timeout_ms = timeout_ms
-        print(f"[在线语音] 开始监听（超时 {self._listen_timeout_ms}ms，WS 就绪后计时）")
+            self._record_ms = timeout_ms
+        self._is_listening = True
+        self._phase = PHASE_RECORDING
+        self._record_start = time.ticks_ms()
+        with self._lock:
+            self._just_finished = False
+            self._last_matched = None
+            self._last_text = ""
+        try:
+            _thread.start_new_thread(self._worker, ())
+        except Exception as e:
+            print(f"[在线语音] 启动会话线程失败: {e}")
+            self._is_listening = False
+            self._phase = PHASE_IDLE
+            return False
+        print(f"[在线语音] 开始录音（{self._record_ms}ms）")
         return True
 
     def stop_listening(self):
-        """按钮触发/超时/命中后：停止监听（会话线程自动暂停释放麦克风）"""
+        """取消当前会话（worker 线程下一拍自行退出并释放麦克风）"""
         if not self._is_listening:
             return
         self._is_listening = False
-        print("[在线语音] 停止监听（暂停释放麦克风）")
+        print("[在线语音] 取消会话")
 
     def is_listening(self):
         return self._is_listening
 
     def check_timeout(self):
-        """主循环调用：超时自动停止监听（仅 WS 就绪后才计时）"""
-        if not self._is_listening:
-            return
-        if not self._ws_ready:
-            return   # WS 还在连接中，不计时
-        if time.ticks_diff(time.ticks_ms(), self._listen_start_time) >= self._listen_timeout_ms:
-            print(f"[在线语音] 监听超时（{self._listen_timeout_ms}ms），自动停止")
-            self.stop_listening()
+        """主循环调用：本模式 worker 线程自管时长，这里空实现（兼容旧调用点）"""
+        return
+
+    def get_phase(self):
+        return self._phase
 
     def get_remaining_ms(self):
-        """返回剩余监听时间（毫秒），未就绪或未监听返回 0"""
-        if not self._is_listening or not self._ws_ready:
+        """录音剩余毫秒（倒计时显示用）；非录音阶段返回 0"""
+        if self._phase != PHASE_RECORDING:
             return 0
-        elapsed = time.ticks_diff(time.ticks_ms(), self._listen_start_time)
-        remaining = self._listen_timeout_ms - elapsed
-        return max(0, remaining)
+        elapsed = time.ticks_diff(time.ticks_ms(), self._record_start)
+        return max(0, self._record_ms - elapsed)
+
+    def poll_finished(self):
+        """主循环调用：本次会话是否刚结束（返回 True 仅一次）"""
+        with self._lock:
+            f = self._just_finished
+            self._just_finished = False
+        return f
+
+    def last_matched(self):
+        """上次会话命中的命令名（None=未命中关键词）"""
+        with self._lock:
+            return self._last_matched
 
     def destroy(self):
         """销毁识别器"""
         self.stop()
+        time.sleep_ms(100)
         self._teardown_recorder()
         print("[在线语音] 已销毁")
 
-    # ---------- 暂停判断 ----------
+    # ---------- 一次性会话 worker ----------
 
-    def _is_paused(self):
-        """暂停判断：未监听时暂停，或外部暂停回调返回 True"""
-        if not self._is_listening:
-            return True
-        if self._pause_callback:
-            try:
-                return bool(self._pause_callback())
-            except Exception:
-                pass
-        return False
+    def _worker(self):
+        """会话线程：录音 → 释放麦克风 → 上传识别 → 关键词匹配 → 标记结束"""
+        matched = None
+        text = ""
+        try:
+            pcm_buf = self._record_audio()
+            # 录完立刻释放麦克风，后续网络阶段完全不碰音频资源
+            self._teardown_recorder()
+            if not self._is_listening:
+                print("[在线语音] 会话被取消（录音阶段）")
+            elif not pcm_buf:
+                print("[在线语音] 未采到音频")
+            else:
+                self._phase = PHASE_UPLOADING
+                matched, text = self._recognize(pcm_buf)
+        except Exception as e:
+            print(f"[在线语音] 会话异常: {e}")
+        finally:
+            self._teardown_recorder()
+            with self._lock:
+                self._last_matched = matched
+                self._last_text = text
+                self._just_finished = True
+            self._phase = PHASE_IDLE
+            self._is_listening = False
+            # 命中则回调（worker 线程内回调，主程序里只做入队，线程安全）
+            if matched and self._callback:
+                try:
+                    self._callback(matched)
+                except Exception as e:
+                    print(f"[在线语音] 回调异常: {e}")
+            print(f"[在线语音] 会话结束 text='{text}' matched={matched}")
 
-    # ---------- 会话主循环 ----------
-
-    def _session_loop(self):
-        """会话调度线程：暂停时释放麦克风等待，否则建立识别会话并自动重连"""
-        print("[在线语音] 会话线程启动")
-        while self._is_running:
-            if self._is_paused():
-                self._teardown_recorder()
-                time.sleep_ms(self._pause_sleep_ms)
-                continue
-            try:
-                self._run_one_session()
-            except Exception as e:
-                print(f"[在线语音] 会话异常: {e}")
-            if self._is_running:
-                time.sleep_ms(self._reconnect_delay_ms)
-        self._teardown_recorder()
-        print("[在线语音] 会话线程退出")
-
-    def _run_one_session(self):
-        """
-        建立并运行一次完整的识别会话。
-        单线程收发交替方案：避免 MicroPython SSLSocket 并发读写问题。
-        流程：开麦 → 连接 → run-task → 等 task-started → 立刻发音频 → 循环(采PCM→发→短超时收)
-        """
-        # MicroPython 无 uuid 模块，用 urandom 生成 task_id
-        self._task_id = ubinascii.hexlify(os.urandom(16)).decode()
-        self._task_started = False
-        self._session_active = True
-
-        # 0. 先开麦（PyAudio 初始化慢，提前开好，避免 task-started 后服务器等太久）
+    def _record_audio(self):
+        """录 record_ms 毫秒 PCM，返回音频块列表（被取消则返回已采部分）"""
         try:
             stream = self._ensure_recorder()
         except Exception as e:
             print(f"[在线语音] 麦克风初始化失败: {e}")
-            self._session_active = False
-            return
+            return []
+        buf = []
+        start = time.ticks_ms()
+        while self._is_listening and time.ticks_diff(time.ticks_ms(), start) < self._record_ms:
+            try:
+                pcm = stream.read()
+            except Exception as e:
+                print(f"[在线语音] 录音读取异常: {e}")
+                break
+            if pcm and len(pcm) > 0:
+                buf.append(bytes(pcm))
+        total = sum(len(b) for b in buf)
+        print(f"[在线语音] 录音完成，{len(buf)} 块 共 {total}B")
+        return buf
 
-        # 1. WS 连接
+    def _recognize(self, pcm_buf):
+        """
+        把整段缓冲音频送 DashScope 识别，返回 (matched_command, full_text)。
+        流程：连 WS → run-task → 等 task-started → 快速发完音频 → finish-task
+              → 收 result-generated 整句 → 关键词匹配 → task-finished/close。
+        """
+        task_id = ubinascii.hexlify(os.urandom(16)).decode()
+        self._task_started = False
+        self._session_active = True
+        ws = None
+        matched = None
+        final_text = ""
         try:
-            self._ws = _WSClient(
+            # 1. WS 连接
+            ws = _WSClient(
                 host=WS_URL_HOST, port=WS_URL_PORT, path=WS_URL_PATH,
                 headers={"Authorization": "bearer " + self._api_key},
             )
-            self._ws.connect()
+            ws.connect()
             print("[在线语音] WS 已连接，发送 run-task...")
-        except Exception as e:
-            print(f"[在线语音] WS 连接失败: {e}")
-            self._session_active = False
-            self._ws = None
-            return
 
-        # 2. 发送 run-task
-        try:
-            self._ws.send_text(json.dumps({
-                "header": {
-                    "action": "run-task",
-                    "task_id": self._task_id,
-                    "streaming": "duplex",
-                },
+            # 2. run-task
+            ws.send_text(json.dumps({
+                "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
                 "payload": {
-                    "task_group": "audio",
-                    "task": "asr",
-                    "function": "recognition",
+                    "task_group": "audio", "task": "asr", "function": "recognition",
                     "model": ASR_MODEL,
                     "parameters": {
                         "format": "pcm",
@@ -485,186 +505,105 @@ class OnlineVoiceRecognition:
                     "input": {},
                 },
             }))
-        except Exception as e:
-            print(f"[在线语音] 发送 run-task 失败: {e}")
-            self._close_session()
-            return
 
-        # 3. 等待 task-started（阻塞收帧，单线程安全）
-        wait_start = time.ticks_ms()
-        while (not self._task_started and self._session_active
-               and self._is_running
-               and time.ticks_diff(time.ticks_ms(), wait_start) < 10000):
-            try:
-                opcode, payload = self._ws.recv()
-            except Exception as e:
-                print(f"[在线语音] 等待 task-started 异常: {e}")
-                self._close_session()
-                return
-            if opcode == OPCODE_CLOSE:
-                print("[在线语音] 等待 task-started 时连接关闭")
-                self._close_session()
-                return
-            if opcode == OPCODE_TEXT:
-                try:
-                    msg = json.loads(payload.decode("utf-8"))
-                except Exception:
-                    continue
-                # 诊断：打印等待阶段收到的所有事件
-                event_name = msg.get("header", {}).get("event", "unknown") if isinstance(msg, dict) else "unknown"
-                print(f"[在线语音 dbg] 等待阶段收到事件: {event_name}")
-                self._dispatch_event(msg)
-                # 如果是 task-failed，_close_session 已被调用，退出
-                if not self._session_active:
-                    return
+            # 3. 等 task-started
+            wait_start = time.ticks_ms()
+            while not self._task_started and time.ticks_diff(time.ticks_ms(), wait_start) < 10000:
+                opcode, payload = ws.recv()
+                if opcode == OPCODE_CLOSE:
+                    print("[在线语音] 等待 task-started 时连接关闭")
+                    return None, ""
+                if opcode == OPCODE_TEXT:
+                    m = self._parse(payload)
+                    ev = m.get("header", {}).get("event", "") if m else ""
+                    if ev == "task-started":
+                        self._task_started = True
+                    elif ev == "task-failed":
+                        h = m.get("header", {})
+                        print(f"[在线语音] 任务失败: {h.get('error_code','')} {h.get('error_message','')}")
+                        return None, ""
+            if not self._task_started:
+                print("[在线语音] 等待 task-started 超时")
+                return None, ""
 
-        if not self._task_started:
-            print("[在线语音] 等待 task-started 超时")
-            self._close_session()
-            return
+            # 4. 快速发完缓冲音频（略带节流，避免一次性灌爆服务端）
+            print(f"[在线语音] 上传 {len(pcm_buf)} 块音频...")
+            for chunk in pcm_buf:
+                ws.send_binary(chunk)
+                time.sleep_ms(10)
 
-        # 4. 主循环：立刻发音频，用 select 非阻塞检查是否有服务器数据
-        #    不用 settimeout（MicroPython ssl.read 超时时可能返回 b"" 被误判为 EOF）
-        print("[在线语音] 开始上传音频")
-        chunk_count = 0
-        while self._session_active and self._is_running:
-            if self._is_paused():
-                print("[在线语音] 进入暂停，结束本次会话")
-                break
-
-            # 4a. 采集并发送音频
-            try:
-                pcm = stream.read()
-                pcm_len = len(pcm) if pcm else 0
-                if chunk_count < 10:
-                    print(f"[在线语音 dbg] chunk#{chunk_count} pcm_len={pcm_len}")
-                if pcm and pcm_len > 0:
-                    self._ws.send_binary(pcm)
-                    chunk_count += 1
-                    if chunk_count % 50 == 0:
-                        print(f"[在线语音] 已上传 {chunk_count} 块 ({pcm_len}B/块)")
-                else:
-                    if chunk_count < 10:
-                        print(f"[在线语音] 警告: 麦克风返回空数据 pcm={pcm}")
-            except Exception as e:
-                print(f"[在线语音] 音频上传异常: {e}")
-                break
-
-            # 4b. 用 select 非阻塞检查原始 socket 是否有数据可读
-            #     注意：SSL 层可能有内部缓冲，select 看不到；每 10 块强制收一次兜底
-            try:
-                readable, _, _ = select.select([self._ws._raw_sock], [], [], 0)
-                should_recv = bool(readable) or (chunk_count % 3 == 0 and chunk_count > 0)
-            except Exception:
-                should_recv = (chunk_count % 3 == 0 and chunk_count > 0)
-
-            if should_recv:
-                try:
-                    # 给 SSL 一个短超时，避免阻塞太久（100ms，不影响音频节奏）
-                    self._ws.set_recv_timeout(0.1)
-                    opcode, payload = self._ws.recv()
-                    if chunk_count <= 20:
-                        payload_preview = ""
-                        if opcode == OPCODE_TEXT and len(payload) < 500:
-                            payload_preview = payload.decode("utf-8", "ignore")[:200]
-                        print(f"[在线语音 dbg] recv opcode={opcode} len={len(payload)} {payload_preview}")
-                    if opcode == OPCODE_CLOSE:
-                        print("[在线语音] 服务端关闭连接")
-                        break
-                    if opcode == OPCODE_TEXT:
-                        try:
-                            msg = json.loads(payload.decode("utf-8"))
-                        except Exception:
-                            continue
-                        self._dispatch_event(msg)
-                        if not self._session_active:
-                            break
-                except OSError:
-                    # 超时：SSL 层无完整数据，正常继续
-                    pass
-                except Exception as e:
-                    print(f"[在线语音] 收帧异常: {e}")
-                    break
-
-        # 5. 发 finish-task 通知服务端结束
-        try:
-            self._ws.send_text(json.dumps({
-                "header": {
-                    "action": "finish-task",
-                    "task_id": self._task_id,
-                    "streaming": "duplex",
-                },
+            # 5. finish-task 通知结束
+            ws.send_text(json.dumps({
+                "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
                 "payload": {"input": {}},
             }))
+
+            # 6. 收结果直到 task-finished / 关闭
+            ws.set_recv_timeout(6.0)
+            collect_start = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), collect_start) < 8000:
+                try:
+                    opcode, payload = ws.recv()
+                except Exception as e:
+                    print(f"[在线语音] 收结果结束: {e}")
+                    break
+                if opcode == OPCODE_CLOSE:
+                    break
+                if opcode != OPCODE_TEXT:
+                    continue
+                m = self._parse(payload)
+                if not m:
+                    continue
+                ev = m.get("header", {}).get("event", "")
+                if ev == "result-generated":
+                    text, is_end = self._extract_sentence(m.get("payload", {}))
+                    if text:
+                        final_text = text
+                        if is_end:
+                            print(f"[在线语音] 识别: {text}")
+                            cmd = self._match_keywords(text)
+                            if cmd:
+                                matched = cmd
+                elif ev in ("task-finished", "task-failed"):
+                    if ev == "task-failed":
+                        h = m.get("header", {})
+                        print(f"[在线语音] 任务失败: {h.get('error_code','')} {h.get('error_message','')}")
+                    break
+        except Exception as e:
+            print(f"[在线语音] 识别异常: {e}")
+        finally:
+            self._session_active = False
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        return matched, final_text
+
+    @staticmethod
+    def _parse(payload):
+        try:
+            return json.loads(payload.decode("utf-8"))
         except Exception:
-            pass
+            return None
 
-        self._close_session()
-
-    def _dispatch_event(self, msg):
-        """解析服务端事件（task-started / result-generated / task-finished / task-failed）"""
-        header = msg.get("header", {}) if isinstance(msg, dict) else {}
-        event = header.get("event", "")
-        if event == "task-started":
-            self._task_started = True
-            self._ws_ready = True
-            self._listen_start_time = time.ticks_ms()   # 从 WS 就绪开始计时
-            print("[在线语音] 服务端就绪，开始上传音频")
-        elif event == "result-generated":
-            self._handle_result(msg.get("payload", {}))
-        elif event == "task-finished":
-            print("[在线语音] 任务完成")
-            self._close_session()
-        elif event == "task-failed":
-            code = header.get("error_code", "")
-            text = header.get("error_message", "")
-            print(f"[在线语音] 任务失败: {code} {text}")
-            self._close_session()
-
-    def _close_session(self):
-        self._session_active = False
-        ws = self._ws
-        if ws:
-            try:
-                ws.close()
-            except Exception:
-                pass
-        self._ws = None
-
-    # ---------- 结果处理与关键词匹配 ----------
-
-    def _handle_result(self, payload):
-        """整句结束时做关键词匹配"""
+    @staticmethod
+    def _extract_sentence(payload):
+        """从 result-generated payload 取 (text, sentence_end)"""
         if not isinstance(payload, dict):
-            return
+            return "", False
         sentence = payload.get("output", {}).get("sentence", {})
         if not isinstance(sentence, dict):
-            return
-        text = sentence.get("text", "") or ""
-        is_end = bool(sentence.get("sentence_end", False))
-        if not text:
-            return
-        if is_end:
-            print(f"[在线语音] 识别: {text}")
-            self._match_keywords(text)
+            return "", False
+        return sentence.get("text", "") or "", bool(sentence.get("sentence_end", False))
 
     def _match_keywords(self, text):
-        """在识别文本中匹配关键词（子串匹配），去抖后触发回调"""
-        now = time.ticks_ms()
+        """子串匹配关键词，返回命中的命令名（None=未命中）"""
         for kw, command in self._keywords.items():
             if kw in text:
-                last = self._last_trigger.get(command, 0)
-                if time.ticks_diff(now, last) < TRIGGER_DEBOUNCE_MS:
-                    continue
-                self._last_trigger[command] = now
                 print(f"[在线语音] 命中: {kw} -> {command}")
-                self.stop_listening()   # 命中即停，释放麦克风
-                if self._callback:
-                    try:
-                        self._callback(command)
-                    except Exception as e:
-                        print(f"[在线语音] 回调异常: {e}")
-                break  # 一句话只触发一个命令
+                return command
+        return None
 
     # ---------- 音频采集与上传 ----------
 
@@ -724,17 +663,20 @@ if __name__ == "__main__":
     # 独立运行需手动 MediaManager.init 才能用 PyAudio
     MediaManager.init()
 
-    ovr = OnlineVoiceRecognition(api_key=API_KEY)
+    ovr = OnlineVoiceRecognition(api_key=API_KEY, record_ms=4000)
     ovr.start(keywords=TEST_KEYWORDS, callback=on_command)
 
     print("=" * 50)
-    print("在线语音识别测试中，请对着麦克风说话...")
+    print("在线语音识别测试（一次性录音模式）")
+    print("每隔几秒自动录 4 秒并识别，请对着麦克风说话...")
     print("（Ctrl+C 退出）")
     print("=" * 50)
 
     try:
         while True:
             os.exitpoint()
+            if not ovr.is_listening():
+                ovr.start_listening(timeout_ms=4000)
             time.sleep_ms(200)
     except KeyboardInterrupt:
         pass
