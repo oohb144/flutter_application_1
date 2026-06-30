@@ -31,6 +31,12 @@ class HttpCmdServer:
             "rtsp_running": False,
             "state": "空闲",
             "audio_busy": False,
+            # 人脸预警字段（由 main.py _update_http_status 按识别态填充）
+            "face_count": 0,
+            "known_count": 0,
+            "unknown_count": 0,
+            "face_labels": [],
+            "alarm": False,
         }
         self._lock = _thread.allocate_lock()
         self._running = False
@@ -75,7 +81,12 @@ class HttpCmdServer:
                   + str(self._status.get("rtsp_url", "")) + "|"
                   + str(self._status.get("rtsp_running", False)) + "|"
                   + str(self._status.get("state", "")) + "|"
-                  + str(self._status.get("audio_busy", False)))
+                  + str(self._status.get("audio_busy", False)) + "|"
+                  + str(self._status.get("face_count", 0)) + "|"
+                  + str(self._status.get("known_count", 0)) + "|"
+                  + str(self._status.get("unknown_count", 0)) + "|"
+                  + str(self._status.get("alarm", False)) + "|"
+                  + ",".join(self._status.get("face_labels", [])))
             if fp != self._last_fingerprint:
                 self._last_fingerprint = fp
                 # MicroPython json.dumps 不支持 ensure_ascii 关键字，

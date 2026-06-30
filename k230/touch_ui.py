@@ -55,14 +55,16 @@ class TouchUI:
             Button([520, 130, 110, 50], "录入", RecvCmd.ENROLL),
             Button([520, 190, 110, 50], "停止", RecvCmd.STOP),
             Button([520, 250, 110, 50], "推流", RecvCmd.RTSP_TOGGLE),
-            Button([520, 310, 110, 50], "WiFi", RecvCmd.WIFI_SETTINGS,
+            Button([520, 310, 110, 50], "语音", RecvCmd.VOICE_START,
+                   color=(40, 120, 80)),
+            Button([520, 370, 110, 50], "WiFi", RecvCmd.WIFI_SETTINGS,
                    color=(40, 80, 140)),
         ]
         # DOWN 事件常量（上板确认；EVENT_DOWN 不存在则退化为 0）
         self._down_evt = getattr(TOUCH, "EVENT_DOWN", 0)
         self._last_evt = None   # 上次事件，用于 DOWN 上升沿触发
         self._last_trigger = 0  # 上次触发时间，用于去抖（防一次按下抖动报多次）
-        print("[触摸UI] 初始化完成，侧边栏 6 按钮（含 WiFi）")
+        print("[触摸UI] 初始化完成，侧边栏 7 按钮（含语音/WiFi）")
 
     def set_active(self, cmd_id):
         """设置当前高亮按钮（状态切换时调）"""

@@ -465,6 +465,12 @@ class WiFiUI:
                     self._status_color = config.TEXT_COLOR_GREEN
                     if self._app._rtsp:
                         self._app._rtsp.set_ip(ip)
+                    # 蜂鸣器：WiFi 连接成功提示音
+                    if getattr(self._app, "_buzzer", None):
+                        try:
+                            self._app._buzzer.beep_wifi()
+                        except Exception:
+                            pass
                     print("[WiFiUI] 连接成功: " + ip)
                 else:
                     self._status_text = "连接失败: " + ssid

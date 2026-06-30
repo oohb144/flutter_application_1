@@ -24,10 +24,12 @@ import config
 from state_machine import StateMachine
 from key_manager import KeyManager
 from led_controller import LedController
+from buzzer_controller import BuzzerController
 from face_detector import FaceDetector
 from wifi_manager import connect_wifi, disconnect_wifi
 from rtsp_manager import RtspManager
 from http_cmd_server import HttpCmdServer
+from voice_manager import VoiceManager
 
 
 class FaceRecognitionApp:
@@ -41,6 +43,7 @@ class FaceRecognitionApp:
         self._face = None
         self._key = None
         self._led = None
+        self._buzzer = None
         self._sm = StateMachine(initial_state=int(config.State.IDLE))
 
         # 网络/推流
@@ -57,14 +60,25 @@ class FaceRecognitionApp:
         self._cmd_queue = []
         self._cmd_lock = _thread.allocate_lock()
 
+        # 在线语音识别（DashScope 流式，按钮触发）
+        self._ovr = None
+        self._voice_cmd_queue = []
+        self._voice_cmd_lock = _thread.allocate_lock()
+
         # 触摸屏 UI
         self._touch = None
+
+        # 离线语音管理器（触摸"语音"按钮触发，kws.kmodel / speech_recognizer）
+        self._voice = None
+        self._voice_wake_queue = []
 
         # 运行时状态
         self._exit_flag = False
         self._last_faces = []          # 缓存上次识别结果（节流用）
         self._last_labeled = []        # 上次完整识别（带 label）的结果
         self._last_recog_time = 0      # 上次完整识别时间
+        self._last_face_present = False  # 蜂鸣器去抖：上帧是否有人脸（边沿触发用）
+        self._last_alarm_time = 0        # 蜂鸣器去抖：上次鸣响时间
         self._toast_msg = ""           # 浮层提示信息（录入/RTSP 等）
         self._toast_time = 0
         self._frame_count = 0
@@ -121,6 +135,11 @@ class FaceRecognitionApp:
         self._wlan = wlan
         if ip:
             self._set_toast(f"WiFi已连 IP:{ip}")
+            if self._buzzer:
+                try:
+                    self._buzzer.beep_wifi()
+                except Exception:
+                    pass
         else:
             self._set_toast("WiFi连接失败，可在WiFi界面手动设置")
 
@@ -198,6 +217,110 @@ class FaceRecognitionApp:
             print(f"[主] HTTP 服务初始化失败（不影响本机识别）: {e}")
             self._http = None
 
+
+    def _init_online_voice(self):
+        """启动在线语音识别（DashScope 流式），默认暂停，按钮触发才开始监听"""
+        if not config.ONLINE_VOICE_ENABLE:
+            print("[主] 在线语音未启用 (ONLINE_VOICE_ENABLE=False)")
+            return
+        if not self._ip:
+            print("[主] 无 IP，跳过在线语音初始化")
+            return
+        try:
+            from online_voice_recognition import OnlineVoiceRecognition
+            self._ovr = OnlineVoiceRecognition(
+                api_key=config.DASHSCOPE_API_KEY,
+                sample_rate=config.ONLINE_VOICE_SAMPLE_RATE,
+                chunk_ms=getattr(config, "ONLINE_VOICE_CHUNK_MS", 100),
+                reconnect_delay_ms=getattr(config, "ONLINE_VOICE_RECONNECT_DELAY_MS", 800),
+            )
+            self._ovr.start(
+                keywords=config.ONLINE_VOICE_KEYWORDS,
+                callback=self._on_voice_command,
+            )
+            # 默认不监听，等按钮触发
+            print("[主] 在线语音已启动（默认暂停，按语音按钮开始监听）")
+        except Exception as e:
+            print(f"[主] 在线语音初始化失败（不影响按键/识别）: {e}")
+            self._ovr = None
+
+    def _on_voice_command(self, command):
+        """在线语音命中回调（会话线程）：仅入队，主循环执行"""
+        with self._voice_cmd_lock:
+            self._voice_cmd_queue.append(command)
+        print("[主] 在线语音命令入队: " + str(command))
+
+    def _process_voice_commands(self):
+        """主循环调用：消费在线语音命令队列"""
+        while True:
+            with self._voice_cmd_lock:
+                if not self._voice_cmd_queue:
+                    return
+                command = self._voice_cmd_queue.pop(0)
+            try:
+                self._set_toast("语音: " + str(command))
+                self._dispatch_http_command({"cmd": command, "source": "voice"})
+            except Exception as e:
+                print(f"[主] 在线语音命令执行异常: {e}")
+
+    def _init_voice(self):
+        """初始化离线语音管理器（懒加载：开机不加载 kws.kmodel 占 KPU，按语音按钮时才加载）"""
+        if not config.VOICE_MGR_ENABLE:
+            print("[主] 离线语音未启用 (VOICE_MGR_ENABLE=False)")
+            return
+        if self._ovr is not None:
+            print("[主] 在线语音已启用，跳过离线语音（麦克风资源互斥）")
+            return
+        if self._voice is not None:
+            return   # 已初始化，不重复
+        try:
+            self._voice = VoiceManager()
+            ok = self._voice.start(
+                on_command=self._on_command,
+                on_wake=self._on_voice_wake,
+            )
+            if ok:
+                mode = self._voice.get_mode()
+                print(f"[主] 离线语音已就绪（方案: {mode}）")
+                self._set_toast(f"语音就绪({mode})")
+            else:
+                print("[主] 离线语音初始化失败")
+                self._voice = None
+        except Exception as e:
+            print(f"[主] 离线语音初始化异常: {e}")
+            self._voice = None
+
+    def _on_voice_wake(self):
+        """kws 唤醒词回调（KWS 线程）：入队，主循环消费切态"""
+        with self._cmd_lock:
+            self._voice_wake_queue.append(True)
+        print("[主] 语音唤醒入队")
+
+    def _process_voice_wake(self):
+        """主循环调用：消费唤醒队列，按当前状态循环切换"""
+        while self._voice_wake_queue:
+            self._voice_wake_queue.pop(0)
+            try:
+                self._cycle_state_on_wake()
+            except Exception as e:
+                print(f"[主] 语音唤醒切态异常: {e}")
+
+    def _cycle_state_on_wake(self):
+        """唤醒词触发：按当前状态循环切换 待机→识别→录入→待机"""
+        if self._sm.is_state(int(config.State.IDLE)):
+            self._sm.transition(int(config.State.RECOGNIZING))
+            self._set_toast("语音: 待机→识别")
+        elif self._sm.is_state(int(config.State.RECOGNIZING)):
+            self._sm.transition(int(config.State.ENROLLING))
+            self._set_toast("语音: 识别→录入")
+        elif self._sm.is_state(int(config.State.ENROLLING)):
+            self._sm.transition(int(config.State.IDLE))
+            self._set_toast("语音: 录入→待机")
+        # 停止本次监听（已切态，等下次按钮触发）
+        if self._voice:
+            self._voice.stop_listening()
+        self._buzz_transition()
+
     def _update_http_status(self):
         """主循环调用：把当前状态上报给 HTTP 服务（指纹变化才重建 JSON）"""
         if self._http is None:
@@ -206,12 +329,34 @@ class FaceRecognitionApp:
             state_name = config.STATE_NAMES.get(self._sm.state, "空闲")
             rtsp_running = self._rtsp is not None and self._rtsp.is_running()
             rtsp_url = self._rtsp.get_url() if self._rtsp else ""
+            # 人脸预警：仅识别态读 _last_labeled；非识别态强制清零，避免残留旧值误报
+            face_count = 0
+            known_count = 0
+            unknown_count = 0
+            face_labels = []
+            alarm = False
+            if self._sm.is_state(int(config.State.RECOGNIZING)):
+                faces = self._last_labeled or []
+                face_count = len(faces)
+                for f in faces:
+                    label = f.get("label", "unknown")
+                    if label and label != "unknown":
+                        known_count += 1
+                        face_labels.append(label)
+                    else:
+                        unknown_count += 1
+                alarm = unknown_count > 0
             self._http.update_status({
                 "ip": self._ip or "",
                 "rtsp_url": rtsp_url,
                 "rtsp_running": rtsp_running,
                 "state": state_name,
                 "audio_busy": False,
+                "face_count": face_count,
+                "known_count": known_count,
+                "unknown_count": unknown_count,
+                "face_labels": face_labels,
+                "alarm": alarm,
             })
         except Exception as e:
             print(f"[主] 状态上报异常: {e}")
@@ -248,6 +393,21 @@ class FaceRecognitionApp:
         print("[主] HTTP 命令: " + str(payload))
         if cmd == "rtsp":
             self._set_rtsp(bool(payload.get("on", True)))
+        elif cmd == "home" or cmd == "stop":
+            # 回主页/停止：切待机态（与串口 HOME/STOP 同语义）
+            self._sm.transition(int(config.State.IDLE))
+        elif cmd == "recognize":
+            self._sm.transition(int(config.State.RECOGNIZING))
+        elif cmd == "enroll":
+            self._sm.transition(int(config.State.ENROLLING))
+        elif cmd == "rtsp_on":
+            self._set_rtsp(True)
+        elif cmd == "rtsp_off":
+            self._set_rtsp(False)
+        elif cmd == "enroll_capture":
+            if not self._sm.is_state(int(config.State.ENROLLING)):
+                self._sm.transition(int(config.State.ENROLLING))
+            self._do_enroll()
         elif cmd == "speak":
             # K230 无本机 TTS；语音播报走外接串口语音模块（无通用文本播报码），
             # 此处仅 LCD 提示 + LED/蜂鸣器反馈。如需文本播报，由电脑端 TTS 播放。
@@ -282,6 +442,8 @@ class FaceRecognitionApp:
         self._led.flash(
             color=config.LED_COLOR_SUCCESS if known else config.LED_COLOR_UNKNOWN,
             times=1, interval_ms=80)
+        # 蜂鸣器反馈：熟人成功音 / 陌生人报警音
+        self._buzz("beep_success" if known else "beep_alarm")
 
     def _set_rtsp(self, on):
         """按目标状态开/关 RTSP 推流（开推流必须在 RECOGNIZING 态，否则 sensor 流转停卡死）"""
@@ -294,6 +456,10 @@ class FaceRecognitionApp:
         if on:
             if not self._sm.is_state(int(config.State.RECOGNIZING)):
                 self._sm.transition(int(config.State.RECOGNIZING))
+            # 推流前彻底释放语音资源（KPU + 麦克风）
+            if self._voice:
+                self._voice.destroy()
+                self._voice = None
             if not self._rtsp.is_running():
                 self._rtsp.start()
             self._set_toast("RTSP开 " + self._rtsp.get_url())
@@ -320,6 +486,11 @@ class FaceRecognitionApp:
         if not self._ip:
             self._set_toast("无 IP，请先连 WiFi")
             return
+        # 推流前彻底释放语音资源（kws.kmodel 占 KPU + PyAudio 占麦克风，与 VENC 冲突）
+        if not self._rtsp.is_running() and self._voice:
+            self._voice.destroy()
+            self._voice = None
+            print("[主] 推流前释放语音资源")
         running = self._rtsp.toggle()
         if running:
             self._set_toast(f"RTSP开 {self._rtsp.get_url()}")
@@ -398,6 +569,38 @@ class FaceRecognitionApp:
                 self._set_toast("退出 WiFi 设置")
                 if self._wifi_ui:
                     self._wifi_ui.exit()
+            self._buzz_transition()  # 切界面提示音
+        elif cmd_id == RecvCmd.VOICE_START:
+            # 触摸"语音"按钮：启动/停止语音监听（优先在线，备选离线）
+            if self._ovr is not None and hasattr(self._ovr, 'start_listening'):
+                # 在线语音（DashScope）
+                if self._ovr.is_listening():
+                    self._ovr.stop_listening()
+                    self._set_toast("语音: 已停止")
+                else:
+                    timeout = getattr(config, "VOICE_LISTEN_TIMEOUT_MS", 8000)
+                    self._ovr.start_listening(timeout_ms=timeout)
+                    self._set_toast("语音监听中...说关键词")
+                    self._buzz_transition()
+            else:
+                # 离线语音：懒加载，第一次按按钮时才初始化（避免开机占 KPU）
+                if self._voice is None:
+                    self._init_voice()
+                if self._voice is not None:
+                    if self._voice.is_listening():
+                        self._voice.stop_listening()
+                        self._set_toast("语音: 已停止")
+                    else:
+                        self._voice.start_listening()
+                        mode = self._voice.get_mode()
+                        if mode == "kws":
+                            wake = getattr(config, "VOICE_WAKE_WORD", "小南小南")
+                            self._set_toast(f"语音监听中...说'{wake}'")
+                        else:
+                            self._set_toast("语音监听中...说关键词")
+                        self._buzz_transition()
+                else:
+                    self._set_toast("语音未就绪")
 
     def _send_state(self, state_cmd):
         """发状态播报给语音模块"""
@@ -409,9 +612,10 @@ class FaceRecognitionApp:
 
     # ---------- 状态进/出回调 ----------
     def _on_enter_idle(self):
-        print("[主] 进入待机态，等待串口语音命令")
+        print("[主] 进入待机态")
         self._led.set_state(int(config.State.IDLE))
-        self._set_toast("待机: 等串口语音命令")
+        self._buzz_transition()
+        self._set_toast("待机: 触摸/按键/语音切换")
         if self._send_cmd:
             self._send_state(self._send_cmd.STATE_IDLE)
         if self._touch:
@@ -424,6 +628,7 @@ class FaceRecognitionApp:
     def _on_enter_recognizing(self):
         print("[主] 进入识别态")
         self._led.set_state(int(config.State.RECOGNIZING))
+        self._buzz_transition()
         if self._send_cmd:
             self._send_state(self._send_cmd.STATE_RECOGNIZING)
         if self._touch:
@@ -436,6 +641,7 @@ class FaceRecognitionApp:
     def _on_enter_enrolling(self):
         print("[主] 进入录入态，短按录入")
         self._led.set_state(int(config.State.ENROLLING))
+        self._buzz_transition()
         self._set_toast("录入态: 短按/串口录入 长按返回")
         if self._send_cmd:
             self._send_state(self._send_cmd.STATE_ENROLLING)
@@ -456,6 +662,7 @@ class FaceRecognitionApp:
             success, msg, count = self._face.enroll_face(img_np)
             if success:
                 self._led.flash(color=config.LED_COLOR_SUCCESS, times=2, interval_ms=80)
+                self._buzz("beep_success")  # 录入成功提示音
                 self._set_toast(f"录入成功: {label} (共{count})")
             else:
                 self._set_toast(f"录入失败: {msg}")
@@ -467,6 +674,34 @@ class FaceRecognitionApp:
         """设置浮层提示信息（显示一段时间后消失）"""
         self._toast_msg = msg
         self._toast_time = time.ticks_ms()
+
+    # ---------- 蜂鸣器反馈 ----------
+    def _buzz(self, method_name):
+        """安全调用蜂鸣器方法（初始化前/禁用时不报错）"""
+        if self._buzzer is None:
+            return
+        try:
+            getattr(self._buzzer, method_name)()
+        except Exception as e:
+            print(f"[主] 蜂鸣器异常: {e}")
+
+    def _buzz_transition(self):
+        """切换界面/状态：短促提示音"""
+        self._buzz("beep_transition")
+
+    def _trigger_face_buzzer(self, faces):
+        """识别到人脸时边沿触发鸣响（去抖）：陌生脸报警 / 熟人成功音。
+        仅在“无人脸->有人脸”边沿触发，避免每帧响、与人脸识别抢 GIL。"""
+        if self._buzzer is None:
+            return
+        present = len(faces) > 0
+        if present and not self._last_face_present:
+            now = time.ticks_ms()
+            if time.ticks_diff(now, self._last_alarm_time) >= config.TRIGGER_DEBOUNCE_MS:
+                has_unknown = any(f.get('class_id', 0) == 0 for f in faces)
+                self._buzz("beep_alarm" if has_unknown else "beep_success")
+                self._last_alarm_time = now
+        self._last_face_present = present
 
     # ---------- WiFi 设置界面（委托给 WiFiUI） ----------
     def _handle_wifi_settings(self):
@@ -499,6 +734,7 @@ class FaceRecognitionApp:
                         self._wifi_mode = False
                         self._wifi_ui.exit()
                         self._set_toast("退出 WiFi 设置")
+                        self._buzz_transition()  # 切界面提示音
             self._touch._last_evt = pt.event
         except Exception as e:
             print("[主] WiFi 触摸处理异常: " + str(e))
@@ -508,27 +744,50 @@ class FaceRecognitionApp:
         """待机态：不取 AI 帧、不跑 KPU，只显示待机提示（最省资源）"""
         osd_img = self._pl.osd_img
         osd_img.clear()
-        osd_img.draw_string_advanced(10, 10, 32, "待机:等串口语音命令",
+        # 标题
+        osd_img.draw_string_advanced(10, 10, 36, "待机",
                                      color=config.TEXT_COLOR_WHITE)
-        osd_img.draw_string_advanced(10, 56, 20, "串口命令: 主页/识别/录入/停止",
-                                     color=config.TEXT_COLOR_YELLOW)
-        osd_img.draw_string_advanced(10, 90, 18, "长按切录入 / 超长按退出",
-                                     color=config.TEXT_COLOR_BLUE)
-        # 状态栏：IP / 已录入数
+        # 状态信息
         try:
             n = self._face.get_class_count()
-            ds = self._pl.get_display_size()
-            osd_img.draw_string_advanced(ds[0] - 200, 10, 22,
-                                         "已录入:" + str(n), color=config.TEXT_COLOR_WHITE)
             ip_str = self._ip if self._ip else "无IP"
-            osd_img.draw_string_advanced(10, 120, 18, "IP:" + ip_str,
+            osd_img.draw_string_advanced(10, 60, 20, "IP: " + ip_str,
                                          color=config.TEXT_COLOR_BLUE)
+            osd_img.draw_string_advanced(10, 86, 20, "已录入: " + str(n) + " 人",
+                                         color=config.TEXT_COLOR_WHITE)
+            # RTSP 状态
+            if self._rtsp and self._rtsp.is_running():
+                osd_img.draw_string_advanced(10, 112, 18, self._rtsp.get_url(),
+                                             color=config.TEXT_COLOR_GREEN)
         except Exception:
             pass
+        # 操作提示
+        osd_img.draw_string_advanced(10, 146, 16, "侧栏: 主页/识别/录入/推流/语音",
+                                     color=config.TEXT_COLOR_YELLOW)
+        osd_img.draw_string_advanced(10, 170, 16, "按键: 长按切录入 超长按退出",
+                                     color=config.TEXT_COLOR_BLUE)
         # 浮层提示
         if self._toast_msg and time.ticks_diff(time.ticks_ms(), self._toast_time) < config.ENROLL_SHOW_TIME:
-            osd_img.draw_string_advanced(10, 150, 26, self._toast_msg,
+            osd_img.draw_string_advanced(10, 200, 26, self._toast_msg,
                                          color=config.TEXT_COLOR_YELLOW)
+        # 语音监听倒计时（在线/离线）
+        _ovr_active = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
+        _voice_active = self._voice and self._voice.is_listening()
+        if _ovr_active:
+            remaining = self._ovr.get_remaining_ms() if hasattr(self._ovr, 'get_remaining_ms') else -1
+            if remaining > 0:
+                sec = (remaining + 999) // 1000
+                osd_img.draw_string_advanced(10, 230, 30,
+                    f"请说话... {sec}s", color=(0, 255, 200))
+            elif remaining == 0:
+                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 连接中...",
+                    color=(255, 200, 0))
+            else:
+                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 监听中...",
+                    color=(0, 255, 200))
+        elif _voice_active:
+            osd_img.draw_string_advanced(10, 230, 26, "[MIC] 监听中...",
+                color=(0, 255, 200))
 
     def _handle_recognizing(self):
         """识别态：每帧轻量检测画框（跟脸紧），节流做完整识别拿 label，按 IoU 合并"""
@@ -552,6 +811,8 @@ class FaceRecognitionApp:
         # 合并：cur_faces 的位置 + last_labeled 的 label
         faces = self._merge_faces(cur_faces, self._last_labeled)
         self._last_faces = faces
+        # 蜂鸣器：识别到人脸时边沿触发（陌生脸报警 / 熟人成功音，去抖）
+        self._trigger_face_buzzer(faces)
         # 绘制
         self._draw_faces(self._pl.osd_img, faces, known_color=config.FACE_BOX_COLOR_KNOWN,
                          unknown_color=config.FACE_BOX_COLOR_UNKNOWN)
@@ -646,6 +907,24 @@ class FaceRecognitionApp:
             if self._rtsp is not None and self._rtsp.is_running():
                 osd_img.draw_string_advanced(10, 64, 20, self._rtsp.get_url(),
                                              color=config.TEXT_COLOR_GREEN)
+            # 语音监听状态（在线/离线）+ 倒计时
+            _ovr_listening = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
+            _voice_listening = self._voice and self._voice.is_listening()
+            if _ovr_listening:
+                remaining = self._ovr.get_remaining_ms() if hasattr(self._ovr, 'get_remaining_ms') else -1
+                if remaining > 0:
+                    sec = (remaining + 999) // 1000   # 向上取整
+                    osd_img.draw_string_advanced(10, 86, 26,
+                        f"请说话... {sec}s", color=(0, 255, 200))
+                elif remaining == 0:
+                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 连接中...",
+                        color=(255, 200, 0))
+                else:
+                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 语音监听中...",
+                        color=(0, 255, 200))
+            elif _voice_listening:
+                osd_img.draw_string_advanced(10, 86, 22, "[MIC] 语音监听中...",
+                                             color=(0, 255, 200))
             # 浮层提示（2 秒内显示）
             if self._toast_msg and time.ticks_diff(time.ticks_ms(), self._toast_time) < config.ENROLL_SHOW_TIME:
                 osd_img.draw_string_advanced(10, 90, 28, self._toast_msg,
@@ -656,6 +935,8 @@ class FaceRecognitionApp:
     # ---------- 主循环 ----------
     def run(self):
         print("[主] 初始化...")
+        # 0. 蜂鸣器（先于 WiFi，以便连上 WiFi 时能鸣响提示）
+        self._buzzer = BuzzerController()
         # 1. WiFi 联网
         self._connect_wifi()
         # 2. 管线（内部创建 sensor 并配置）
@@ -668,6 +949,9 @@ class FaceRecognitionApp:
         self._register_states()
         # 6. HTTP 命令服务（电脑端联机接口）
         self._init_http()
+        # 7. 在线语音识别（DashScope 流式，按钮触发监听）
+        self._init_online_voice()
+        # 8. 离线语音：懒加载（不在开机时加载 kws.kmodel 占 KPU，按语音按钮时才初始化）
         # 触发进入待机态回调（设置 LED；默认 IDLE 不经 transition，故手动触发）
         self._on_enter_idle()
         print("[主] 进入主循环")
@@ -688,6 +972,14 @@ class FaceRecognitionApp:
                 self._led.update()
                 # 串口命令（主线程消费队列）
                 self._process_commands()
+                # 离线语音：唤醒队列消费 + 超时自动停止
+                self._process_voice_wake()
+                if self._voice:
+                    self._voice.check_timeout()
+                # 在线语音：命令队列消费 + 监听超时检查
+                self._process_voice_commands()
+                if self._ovr and hasattr(self._ovr, 'check_timeout'):
+                    self._ovr.check_timeout()
                 # HTTP 命令 + face_result（主线程消费队列，电脑端联机）
                 self._process_http_commands()
                 self._process_face_results()
@@ -732,6 +1024,16 @@ class FaceRecognitionApp:
         except Exception:
             pass
         try:
+            if self._ovr:
+                self._ovr.destroy()
+        except Exception:
+            pass
+        try:
+            if self._voice:
+                self._voice.destroy()
+        except Exception:
+            pass
+        try:
             if self._rtsp:
                 self._rtsp.stop()
         except Exception:
@@ -749,6 +1051,11 @@ class FaceRecognitionApp:
         try:
             if self._led:
                 self._led.destroy()
+        except Exception:
+            pass
+        try:
+            if self._buzzer:
+                self._buzzer.destroy()
         except Exception:
             pass
         try:

@@ -97,9 +97,14 @@ FACE_BOX_COLOR_DETECTED = (255, 255, 0)  # 仅检测（录入态）- 黄
 
 # ==================== 功能开关 ====================
 AUDIO_ENABLE = True
+BUZZER_ENABLE = True  # 蜂鸣器提示（切换界面/连WiFi/识别到人脸等；False 全静音）
 LED_ENABLE = True
 VOICE_ENABLE = False  # 本机KWS（麦克风采集疑似有问题，跳过；voice_recognition.py 备用）
-ONLINE_VOICE_ENABLE = False  # 在线语音（阶段4，默认关，见思路文档）
+ONLINE_VOICE_ENABLE = False  # 在线语音（DashScope 流式识别，连接不稳定暂关）
+# 哪些状态自动暂停语音识别（让出麦克风/网络/避免 GIL 抢占）
+# 用整数：RECOGNIZING=1 / ENROLLING=2 / RECORDING=3 / MANUAL_RECORDING=4
+# 默认 set() = 始终听（用户选择，可能影响识别帧率；卡得受不了改成 {1} 暂停识别态）
+VOICE_PAUSE_STATES = set()
 SERIAL_ENABLE = True  # 串口语音模块（外接 SU-03T/ASRPRO，K230 不碰音频）
 SERIAL_BAUDRATE = 115200  # 串口波特率（语音模块端需一致）
 TOUCH_ENABLE = True  # 触摸屏 GUI（豪华版 ST7701，OSD 侧边栏）
@@ -148,6 +153,25 @@ WIFI_PRESETS = [
     ("Office",        "office_wifi_pwd"),
 ]
 
+# ==================== 语音管理器配置（离线关键词，方案二） ====================
+# 触摸"语音"按钮 → 开始监听 → 识别到关键词 → 切换界面
+# 优先 speech_recognizer（离线多词），不可用时回退 kws.kmodel（唤醒词"小南小南"循环切态）
+VOICE_MGR_ENABLE = True   # 语音管理器总开关
+VOICE_LISTEN_TIMEOUT_MS = 8000   # 按键触发后监听超时（毫秒），WS 就绪后才开始计时
+VOICE_WAKE_WORD = "小南小南"     # kws.kmodel 回退方案唤醒词（固化在模型里，仅显示用）
+VOICE_WAKE_THRESHOLD = 0.5       # kws.kmodel 唤醒阈值
+# speech_recognizer 离线关键词 -> 命令名（固件支持时生效；不支持则走 kws 回退）
+VOICE_CMD_KEYWORDS = {
+    "主界面": "home",
+    "主页": "home",
+    "识别": "recognize",
+    "开始识别": "recognize",
+    "录入": "enroll",
+    "开始录入": "enroll",
+    "停止": "stop",
+    "推流": "rtsp_toggle",
+}
+
 # ==================== 语音识别配置（阶段4） ====================
 # 单唤醒词（kws.kmodel，固化"小南小南"，占KPU需时分复用）
 # 注：当前固件(CanMV v1.4.3 yahboom)无 speech_recognizer/media.audio，
@@ -183,6 +207,10 @@ ONLINE_VOICE_KEYWORDS = {
 # DashScope 在线识别（阶段4思路文档用）
 DASHSCOPE_API_KEY = "sk-dc4553ef7fe74c5283f05e4dc7d60adb"
 ONLINE_VOICE_SAMPLE_RATE = 16000
+# 每次采集/上传的音频块时长（毫秒），越小延迟越低但网络开销越大
+ONLINE_VOICE_CHUNK_MS = 100
+# 会话断开后的重连等待时长（毫秒），避免快速重试刷屏/打服务端
+ONLINE_VOICE_RECONNECT_DELAY_MS = 800
 
 
 # ==================== 状态定义 ====================
