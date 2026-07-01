@@ -65,6 +65,8 @@ class FaceRecognitionApp:
         self._voice_cmd_queue = []
         self._voice_cmd_lock = _thread.allocate_lock()
         self._rtsp_resume_after_voice = False  # 录音前暂停了 RTSP，录完需恢复
+        self._voice_text = ""        # 最近一次识别到的文本（屏幕显示用）
+        self._voice_text_time = 0    # 文本产生时刻（控制显示时长）
 
         # 触摸屏 UI
         self._touch = None
@@ -87,6 +89,10 @@ class FaceRecognitionApp:
         # WiFi 设置界面状态
         self._wifi_mode = False        # True: 在 WiFi 设置全屏界面
         self._wifi_ui = None           # WiFiUI 实例（_init_modules 中创建）
+
+        # 阈值设置界面状态
+        self._threshold_mode = False   # True: 在 阈值设置全屏界面
+        self._threshold_ui = None      # ThresholdUI 实例（_init_modules 中创建）
 
     # ---------- 初始化 ----------
     def _init_pipeline(self):
@@ -153,6 +159,19 @@ class FaceRecognitionApp:
             recognize_th=config.FACE_RECOGNIZE_THRESHOLD,
             use_alignment=True,
         )
+        # 持久化阈值覆盖：读 /data/threshold.json 覆盖 config 默认值
+        try:
+            from threshold_ui import load_saved_threshold
+            saved = load_saved_threshold()
+            if saved:
+                rc = saved.get("recognize")
+                cf = saved.get("conf")
+                io = saved.get("iou")
+                if rc is not None or cf is not None or io is not None:
+                    self._face.set_detect_threshold(conf_th=cf, iou_th=io, recognize_th=rc)
+                    print("[主] 已加载保存的阈值: " + str(saved))
+        except Exception as e:
+            print(f"[主] 加载阈值失败（用默认）: {e}")
         print("[主] FaceDetector 完成")
         print("[主] 初始化 LedController...")
         self._led = LedController()
@@ -193,6 +212,10 @@ class FaceRecognitionApp:
         from wifi_ui import WiFiUI
         self._wifi_ui = WiFiUI(self)
         print("[主] WiFiUI 完成")
+        print("[主] 初始化 ThresholdUI...")
+        from threshold_ui import ThresholdUI
+        self._threshold_ui = ThresholdUI(self)
+        print("[主] ThresholdUI 完成")
 
     def _register_states(self):
         """注册状态机 handler 与进/出回调"""
@@ -272,6 +295,14 @@ class FaceRecognitionApp:
         if not self._ovr.poll_finished():
             return
         matched = self._ovr.last_matched()
+        # 捕获识别文本供屏幕显示（无论是否命中关键词）
+        try:
+            txt = self._ovr.last_text() or ""
+        except Exception:
+            txt = ""
+        if txt:
+            self._voice_text = txt
+            self._voice_text_time = time.ticks_ms()
         if matched:
             # 命中关键词：命令已由 _process_voice_commands 执行，提示即可
             self._buzz("beep_success")
@@ -473,7 +504,7 @@ class FaceRecognitionApp:
         self._buzz("beep_success" if known else "beep_alarm")
 
     def _set_rtsp(self, on):
-        """按目标状态开/关 RTSP 推流（开推流必须在 RECOGNIZING 态，否则 sensor 流转停卡死）"""
+        """按目标状态开/关 RTSP 推流（仅控制推流，不改变当前状态机状态）"""
         if self._rtsp is None:
             self._set_toast("RTSP 未初始化")
             return
@@ -481,9 +512,7 @@ class FaceRecognitionApp:
             self._set_toast("无 IP，请先连 WiFi")
             return
         if on:
-            if not self._sm.is_state(int(config.State.RECOGNIZING)):
-                self._sm.transition(int(config.State.RECOGNIZING))
-            # 推流前彻底释放语音资源（KPU + 麦克风）
+            # 推流前彻底释放语音资源（KPU + 麦克风，与 VENC 互斥）
             if self._voice:
                 self._voice.destroy()
                 self._voice = None
@@ -568,18 +597,14 @@ class FaceRecognitionApp:
         elif cmd_id == RecvCmd.ENROLL:
             self._sm.transition(int(config.State.ENROLLING))
         elif cmd_id == RecvCmd.RTSP_ON:
-            if not self._sm.is_state(int(config.State.RECOGNIZING)):
-                self._sm.transition(int(config.State.RECOGNIZING))
+            # 仅开推流，不切状态机
             if self._rtsp and self._ip and not self._rtsp.is_running():
                 self._rtsp.toggle()
         elif cmd_id == RecvCmd.RTSP_OFF:
             if self._rtsp and self._rtsp.is_running():
                 self._rtsp.toggle()
         elif cmd_id == RecvCmd.RTSP_TOGGLE:
-            # 推流必须在 RECOGNIZING 态：需 get_frame+KPU 消费 CHN2 推进 sensor 流转，
-            # 否则 IDLE 态 CHN2 不消费，sensor 流转停 → RTSP 卡死 + CHN2 snapshot failed
-            if not self._sm.is_state(int(config.State.RECOGNIZING)):
-                self._sm.transition(int(config.State.RECOGNIZING))
+            # 仅切换推流，不切状态机（推流只依赖 sensor CHN0->VENC，与识别态无关）
             self._toggle_rtsp()
         elif cmd_id == RecvCmd.ENROLL_CAPTURE:
             if not self._sm.is_state(int(config.State.ENROLLING)):
@@ -597,6 +622,18 @@ class FaceRecognitionApp:
                 if self._wifi_ui:
                     self._wifi_ui.exit()
             self._buzz_transition()  # 切界面提示音
+        elif cmd_id == RecvCmd.THRESHOLD_SETTINGS:
+            # 触摸"阈值"按钮：进入/退出 阈值设置界面
+            self._threshold_mode = not self._threshold_mode
+            if self._threshold_mode:
+                self._set_toast("进入阈值设置")
+                if self._threshold_ui:
+                    self._threshold_ui.enter()
+            else:
+                self._set_toast("退出阈值设置")
+                if self._threshold_ui:
+                    self._threshold_ui.exit()
+            self._buzz_transition()
         elif cmd_id == RecvCmd.VOICE_START:
             # 触摸"语音"按钮：一次性录音识别（录 4s → 上传 → 回发切界面）
             if self._ovr is None:
@@ -755,6 +792,42 @@ class FaceRecognitionApp:
         except Exception as e:
             print("[主] WiFi 触摸处理异常: " + str(e))
 
+    # ---------- 阈值设置界面（委托给 ThresholdUI） ----------
+    def _handle_threshold_settings(self):
+        """全屏 OSD 绘制 + 触摸处理，全部委托给 ThresholdUI 实例"""
+        if self._threshold_ui is None:
+            self._threshold_mode = False
+            return
+        # 绘制全屏 OSD
+        self._threshold_ui.draw(self._pl.osd_img)
+        # 触摸处理：复用 TouchUI 的去抖状态（DOWN 上升沿 + 300ms 去抖）
+        if self._touch is None:
+            return
+        try:
+            pts = self._touch._tp.read(1)
+            if not pts:
+                self._touch._last_evt = None
+                return
+            pt = pts[0]
+            down_evt = self._touch._down_evt
+            is_down = (pt.event == down_evt)
+            last_evt = self._touch._last_evt
+            is_down_edge = (is_down and last_evt != down_evt)
+            if is_down_edge:
+                now = time.ticks_ms()
+                if time.ticks_diff(now, self._touch._last_trigger) >= 300:
+                    self._touch._last_trigger = now
+                    result = self._threshold_ui.handle_touch(pt, is_down_edge=True)
+                    if result == "exit":
+                        # ThresholdUI 通知退出（已保存）
+                        self._threshold_mode = False
+                        self._threshold_ui.exit()
+                        self._set_toast("阈值已保存")
+                        self._buzz_transition()  # 切界面提示音
+            self._touch._last_evt = pt.event
+        except Exception as e:
+            print("[主] 阈值触摸处理异常: " + str(e))
+
     # ---------- 状态 handler ----------
     def _handle_idle(self):
         """待机态：不取 AI 帧、不跑 KPU，只显示待机提示（最省资源）"""
@@ -786,20 +859,11 @@ class FaceRecognitionApp:
         if self._toast_msg and time.ticks_diff(time.ticks_ms(), self._toast_time) < config.ENROLL_SHOW_TIME:
             osd_img.draw_string_advanced(10, 200, 26, self._toast_msg,
                                          color=config.TEXT_COLOR_YELLOW)
-        # 语音监听倒计时（在线一次性录音）
-        _ovr_active = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
-        _voice_active = self._voice and self._voice.is_listening()
-        if _ovr_active:
-            remaining = self._ovr.get_remaining_ms() if hasattr(self._ovr, 'get_remaining_ms') else -1
-            if remaining > 0:
-                sec = (remaining + 999) // 1000
-                osd_img.draw_string_advanced(10, 230, 30,
-                    f"请说话... {sec}s", color=(0, 255, 200))
-            else:
-                osd_img.draw_string_advanced(10, 230, 26, "[MIC] 识别中...",
-                    color=(255, 200, 0))
-        elif _voice_active:
-            osd_img.draw_string_advanced(10, 230, 26, "[MIC] 监听中...",
+        # 语音识别屏幕提示（录音中/识别中/识别文本）
+        self._draw_voice_status(self._pl.osd_img, 230)
+        # 离线语音（kws）监听中提示
+        if self._voice and self._voice.is_listening():
+            osd_img.draw_string_advanced(10, 262, 22, "[MIC] 监听中...",
                 color=(0, 255, 200))
 
     def _handle_recognizing(self):
@@ -906,6 +970,48 @@ class FaceRecognitionApp:
             except Exception as e:
                 print(f"[主] 绘制人脸异常: {e}")
 
+    def _draw_voice_status(self, osd_img, y):
+        """绘制在线语音识别的屏幕提示（录音中/识别中/识别结果文本）。
+        y 为起始纵坐标。三态：录音倒计时、上传等待、识别到的文本。"""
+        if self._ovr is None or not hasattr(self._ovr, 'is_listening'):
+            return
+        try:
+            listening = self._ovr.is_listening()
+            # ovr 阶段常量：PHASE_IDLE=0 / PHASE_RECORDING=1 / PHASE_UPLOADING=2
+            phase = self._ovr.get_phase() if hasattr(self._ovr, 'get_phase') else 0
+        except Exception:
+            listening = False
+            phase = 0
+
+        # 1) 会话进行中：录音倒计时 或 上传等待
+        if listening:
+            if phase == 1:  # RECORDING
+                remaining = self._ovr.get_remaining_ms() if hasattr(self._ovr, 'get_remaining_ms') else -1
+                if remaining > 0:
+                    sec = (remaining + 999) // 1000
+                    osd_img.draw_string_advanced(10, y, 30,
+                        f"请说话... {sec}s", color=(0, 255, 200))
+                else:
+                    osd_img.draw_string_advanced(10, y, 26, "请说话...",
+                        color=(0, 255, 200))
+            elif phase == 2:  # UPLOADING
+                osd_img.draw_string_advanced(10, y, 24, "识别中，请稍候...",
+                    color=(255, 200, 0))
+                # 上传阶段若已有实时文本，紧接着显示
+                try:
+                    live = self._ovr.last_text() or ""
+                except Exception:
+                    live = ""
+                if live:
+                    osd_img.draw_string_advanced(10, y + 30, 22,
+                        "识别: " + live, color=(0, 255, 200))
+            return
+
+        # 2) 会话已结束：在显示窗口内展示识别到的文本（5 秒）
+        if self._voice_text and time.ticks_diff(time.ticks_ms(), self._voice_text_time) < 5000:
+            osd_img.draw_string_advanced(10, y, 24,
+                "识别: " + self._voice_text, color=(0, 255, 200))
+
     def _draw_status(self, osd_img, status):
         try:
             # 顶部状态栏
@@ -920,24 +1026,15 @@ class FaceRecognitionApp:
             if self._rtsp is not None and self._rtsp.is_running():
                 osd_img.draw_string_advanced(10, 64, 20, self._rtsp.get_url(),
                                              color=config.TEXT_COLOR_GREEN)
-            # 语音监听状态（在线一次性录音）+ 倒计时
-            _ovr_listening = self._ovr and hasattr(self._ovr, 'is_listening') and self._ovr.is_listening()
-            _voice_listening = self._voice and self._voice.is_listening()
-            if _ovr_listening:
-                remaining = self._ovr.get_remaining_ms() if hasattr(self._ovr, 'get_remaining_ms') else -1
-                if remaining > 0:
-                    sec = (remaining + 999) // 1000   # 向上取整
-                    osd_img.draw_string_advanced(10, 86, 26,
-                        f"请说话... {sec}s", color=(0, 255, 200))
-                else:
-                    osd_img.draw_string_advanced(10, 86, 22, "[MIC] 识别中...",
-                        color=(255, 200, 0))
-            elif _voice_listening:
-                osd_img.draw_string_advanced(10, 86, 22, "[MIC] 语音监听中...",
+            # 语音识别屏幕提示（录音中/识别中/识别文本）
+            self._draw_voice_status(osd_img, 86)
+            # 离线语音（kws）监听中提示
+            if self._voice and self._voice.is_listening():
+                osd_img.draw_string_advanced(10, 118, 22, "[MIC] 监听中...",
                                              color=(0, 255, 200))
-            # 浮层提示（2 秒内显示）
+            # 浮层提示（2 秒内显示；下移避开语音文本区）
             if self._toast_msg and time.ticks_diff(time.ticks_ms(), self._toast_time) < config.ENROLL_SHOW_TIME:
-                osd_img.draw_string_advanced(10, 90, 28, self._toast_msg,
+                osd_img.draw_string_advanced(10, 150, 28, self._toast_msg,
                                              color=config.TEXT_COLOR_YELLOW)
         except Exception:
             pass
@@ -996,6 +1093,9 @@ class FaceRecognitionApp:
                 if self._wifi_mode:
                     # WiFi 设置全屏界面：自己处理触摸和绘制，不画状态机和侧边栏
                     self._handle_wifi_settings()
+                elif self._threshold_mode:
+                    # 阈值设置全屏界面：自己处理触摸和绘制
+                    self._handle_threshold_settings()
                 else:
                     if self._touch:
                         self._touch.update()

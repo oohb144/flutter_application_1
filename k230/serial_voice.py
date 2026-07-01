@@ -57,7 +57,8 @@ class RecvCmd:
     ENROLL_CAPTURE = 0x07   # 录入当前帧
     RTSP_TOGGLE    = 0x08   # 触摸推流按钮专用（toggle）；串口用 RTSP_ON/OFF
     WIFI_SETTINGS  = 0x09   # 进入/退出 WiFi 设置界面（触摸 WiFi 按钮）
-    VOICE_START    = 0x0A   # 触摸语音按钮：启动离线语音监听
+    VOICE_START    = 0x0A   # 触摸语音按钮：启动在线语音录音识别
+    THRESHOLD_SETTINGS = 0x0B  # 进入/退出 阈值设置界面（触摸 阈值 按钮）
 
 
 class SendCmd:
@@ -79,6 +80,7 @@ RECV_CMD_NAMES = {
     RecvCmd.RTSP_TOGGLE: "RTSP_TOGGLE",
     RecvCmd.WIFI_SETTINGS: "WIFI_SETTINGS",
     RecvCmd.VOICE_START: "VOICE_START",
+    RecvCmd.THRESHOLD_SETTINGS: "THRESHOLD_SETTINGS",
 }
 
 

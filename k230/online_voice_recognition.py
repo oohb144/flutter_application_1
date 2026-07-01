@@ -407,6 +407,11 @@ class OnlineVoiceRecognition:
         with self._lock:
             return self._last_matched
 
+    def last_text(self):
+        """上次会话识别到的完整文本（空串=未识别到/会话未结束）"""
+        with self._lock:
+            return self._last_text
+
     def destroy(self):
         """销毁识别器"""
         self.stop()
@@ -559,6 +564,9 @@ class OnlineVoiceRecognition:
                     text, is_end = self._extract_sentence(m.get("payload", {}))
                     if text:
                         final_text = text
+                        # 实时回写，供屏幕在上传阶段即时显示识别文本
+                        with self._lock:
+                            self._last_text = text
                         if is_end:
                             print(f"[在线语音] 识别: {text}")
                             cmd = self._match_keywords(text)
